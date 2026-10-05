@@ -14,7 +14,7 @@
 4. 안읽음이 없을 때까지 반복한 뒤 디스플레이를 해제한다.
 5. 사용자가 물리 화면에서 카톡을 쓰는 중이면 그 회차는 건너뛴다 (채널을 열기 직전에도 다시 확인한다).
 
-알림이 꺼진 채널은 알림 기반 트리거가 동작하지 않아서 **주기적 폴링**(기본 30분)으로 확인한다. 조사 과정과 시행착오는 [docs/design-notes.md](docs/design-notes.md).
+알림이 꺼진 채널은 알림 기반 트리거가 동작하지 않아서 **폴링**으로 확인한다. 폰이 **잠겨 있으면 가상 디스플레이로 보낸 입력이 무시되므로**, 잠금 상태를 짧은 간격(30초)으로 확인하고 **잠금이 풀려 있는 동안에만** 사이클을 돌린다 (풀린 직후 한 번, 이후 3분마다). 조사 과정과 시행착오는 [docs/design-notes.md](docs/design-notes.md).
 
 ## 요구사항
 
@@ -42,10 +42,11 @@ adb connect <폰 IP>:5555        # 처음 한 번 폰에서 "항상 허용" 승�
 cp daemon/config.example.json daemon/config.json   # serial/connect 를 폰 주소로 수정
 
 # 4) 확인
+python daemon/kakao_mute.py check-lock    # 폰이 잠겨 있는지 (잠김/풀림/판별 불가)
 python daemon/kakao_mute.py check-guard   # 물리 화면에서 카톡이 켜져 있는지
 python daemon/kakao_mute.py discover      # 폴더 탭까지만 열고 목록 노드 출력 (채널은 안 연다)
 python daemon/kakao_mute.py once          # 사이클 1회
-python daemon/kakao_mute.py run           # 폴링 루프
+python daemon/kakao_mute.py run           # 폴링 루프 (잠금 해제 중에만 사이클)
 ```
 
 ## 설정 (`daemon/config.json`)
@@ -56,12 +57,14 @@ python daemon/kakao_mute.py run           # 폴링 루프
 | `folder_tab` | `광고` | 폴더 탭 이름 |
 | `chat_name_id` | `com.kakao.talk:id/name` | 채널 이름 노드의 resource-id |
 | `unread_badge_id` | `com.kakao.talk:id/unread_count` | 안읽음 배지 노드의 resource-id |
-| `poll_interval_sec` | 1800 | 폴링 간격 |
+| `lock_check_interval_sec` | 30 | 잠금 상태 확인 간격 |
+| `unlocked_cycle_interval_sec` | 180 | 잠금이 풀려 있는 동안 사이클 간격 |
+| `unlock_settle_sec` | 5 | 잠금이 풀린 직후 사이클 전에 기다리는 시간 |
 | `dwell_sec` | 3 | 채널을 열어두는 시간 |
 | `max_open_per_cycle` | 20 | 한 회차에 열 최대 채널 수 |
 | `skip_if_foreground` | `["com.kakao.talk"]` | 물리 화면에서 이 앱이 켜져 있으면 회차를 건너뜀 |
 | `discord_webhook_url` | `""` | 실패 알림 (환경변수 `KMUTE_DISCORD_WEBHOOK`도 가능) |
-| `alert_after_failures` / `alert_repeat_every` | 2 / 6 | 연속 실패 알림 시작 회수 / 반복 간격(회) |
+| `alert_after_sec` / `alert_repeat_sec` | 1800 / 10800 | 실패가 이 시간 이상 계속되면 알림 / 알림 반복 간격 |
 | `alert_min_interval_sec` | 21600 | 같은 채널의 멈춤 알림 최소 간격 |
 
 resource-id는 카톡을 업데이트하면 바뀔 수 있다. 동작이 깨지면 `discover`로 다시 확인한다.
@@ -77,8 +80,9 @@ resource-id는 카톡을 업데이트하면 바뀔 수 있다. 동작이 깨지�
 ## 알려진 제약
 
 - **폰이 잠겨 있으면 동작하지 않는다 (관찰).** 같은 코드와 같은 좌표로, 화면이 켜져 있어도 잠금 상태에서는 가상 디스플레이로 보낸 탭이 무시됐고, 잠금을 풀자 정상 동작했다. 원인은 키가드(잠금 화면)로 추정하지만 다른 요인과 완전히 분리해 확인하지는 않았다.
-- 이 상태에서 사이클은 "폴더 탭 선택 실패"로 중단되며 채널을 열지 않는다 (다른 탭의 친구 채팅을 건드리지 않는다). 다만 잠겨 있는 동안 연속 실패 알림이 반복될 수 있다 (미해결).
-- 즉 현재는 **폰이 잠금 해제된 동안에만** 읽음 처리가 된다.
+- 그래서 데몬은 잠금 상태(`dumpsys trust`의 `deviceLocked`, `dumpsys window`의 `isKeyguardShowing`)를 확인해, 잠겨 있으면 사이클을 돌리지 않는다. 이건 실패로 세지 않아서 알림도 가지 않는다.
+- 만약 잠금 판별을 놓쳐 사이클이 돌아도, 탭 선택 검증이 실패해 중단되고 채널을 열지 않는다 (다른 탭의 친구 채팅을 건드리지 않는다).
+- 즉 읽음 처리는 **폰이 잠금 해제된 동안에만** 된다. 광고 배지는 폰을 켜서 잠금을 푼 뒤 최대 약 수십 초 안에 사이클이 돌아 지워진다 (해제 직후 사이클 + 안정화 대기).
 
 ## 보안 주의
 
@@ -91,7 +95,7 @@ resource-id는 카톡을 업데이트하면 바뀔 수 있다. 동작이 깨지�
 - 더미 Surface 가상 디스플레이에서 카톡이 렌더링되고, 채널을 열었다 닫으면 폰의 안읽음 배지와 숫자가 사라진다.
 - `adb tcpip 5555`가 Wi-Fi 전환 후에도 유지되고, Tailscale 경유로 모바일 데이터에서도 접속된다.
 - 물리 화면에서 카톡 사용 중임을 감지하는 가드 파서.
-- 폴링 로직(멈춤 감지, 가드 재확인, 알림)은 가짜 폰/웹훅으로 `tests/test_daemon.py`에서 검증.
+- 폴링 로직(잠금 판별 파싱, 잠금 중 사이클 생략, 해제 직후/간격 사이클, 멈춤 감지, 가드 재확인, 시간 기준 알림과 복구)은 가짜 폰/웹훅으로 `tests/test_daemon.py`에서 검증. 실기기에서는 `check-lock`이 잠김/풀림을 각각 맞게 판별하고, 풀린 상태에서 `Poller.step()` 1회가 사이클을 정상 실행하는 것을 확인했다. 잠금 → 해제 전환을 실기기에서 `run`으로 지켜보거나 며칠 돌려본 것은 아직 아니다.
 
 확인하지 못함:
 - 수일 단위 장시간 폴링 안정성, 며칠 뒤에도 adb 인증이 유지되는지 (무선 디버깅 페어링이 8일 만에 풀린 사례가 있었다).

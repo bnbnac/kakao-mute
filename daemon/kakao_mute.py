@@ -6,8 +6,9 @@
   -> 카톡 실행 -> 폴더 탭 -> 맨 위 행에 안읽음이 있으면 열고 닫기를 반복 -> 디스플레이 해제
 
 서브커맨드:
-  run        폴링 루프 (poll_interval_sec 간격)
-  once       사이클 1회
+  run        폴링 루프: 잠금 상태를 짧은 간격으로 확인하고, 풀려 있을 때만 사이클을 돌린다
+  once       사이클 1회 (잠금 확인 없이)
+  check-lock 폰의 잠금 상태 출력
   discover   폴더 탭까지만 열고 목록의 노드(resource-id/bounds)를 출력. 채널 행은 열지 않는다.
   check-guard  물리 화면의 포커스 앱을 출력
 
@@ -43,7 +44,9 @@ DEFAULTS = {
     "unread_badge_id": None,
     "display_size": "1080x2340",
     "dpi": 420,
-    "poll_interval_sec": 1800,
+    "lock_check_interval_sec": 30,
+    "unlocked_cycle_interval_sec": 180,
+    "unlock_settle_sec": 5,
     "launch_wait_sec": 4,
     "settle_sec": 1.2,
     "dwell_sec": 3,
@@ -51,8 +54,8 @@ DEFAULTS = {
     "helper_max_sec": 180,
     "skip_if_foreground": ["com.kakao.talk"],
     "discord_webhook_url": "",
-    "alert_after_failures": 2,
-    "alert_repeat_every": 6,
+    "alert_after_sec": 1800,
+    "alert_repeat_sec": 10800,
     "alert_min_interval_sec": 21600,
 }
 
@@ -124,6 +127,26 @@ def foreground_packages_display0(adb):
         if m:
             pkgs.add(m.group(1))
     return pkgs
+
+
+def device_locked(adb):
+    """폰이 잠겨 있으면 True, 풀려 있으면 False, 판별 불가면 None.
+
+    잠금 상태에서는 가상 디스플레이로 보낸 탭이 무시된다. 값이 둘 중 하나라도 잠금이면 잠금으로 본다.
+    """
+    out = adb.shell("dumpsys trust | grep deviceLocked")
+    m = re.search(r"\(current\).*?deviceLocked=(\d)", out, re.S) or re.search(r"deviceLocked=(\d)", out)
+    trust = (m.group(1) == "1") if m else None
+    if trust:
+        return True
+    out = adb.shell("dumpsys window | grep isKeyguardShowing")
+    m = re.search(r"isKeyguardShowing=(true|false)", out)
+    keyguard = (m.group(1) == "true") if m else None
+    if keyguard:
+        return True
+    if trust is None and keyguard is None:
+        return None
+    return False
 
 
 def guard_blocked(cfg, adb):
@@ -366,6 +389,76 @@ def run_cycle(cfg, adb, mode="walk", notifier=None):
         log.info("가상 디스플레이 해제")
 
 
+class Poller:
+    """잠금 상태를 짧은 간격으로 확인하고, 풀려 있을 때만 사이클을 돌린다.
+
+    - 잠겨 있으면 사이클을 돌리지 않는다 (입력이 무시되므로). 이건 실패가 아니다.
+    - 잠금이 풀린 직후 한 번, 이후 풀려 있는 동안 unlocked_cycle_interval_sec 마다 사이클을 돌린다.
+    - 확인 자체나 사이클이 연속으로 alert_after_sec 이상 실패하면 알린다.
+    """
+
+    def __init__(self, cfg, adb, notifier, clock=time.time, sleep=time.sleep):
+        self.cfg, self.adb, self.notifier = cfg, adb, notifier
+        self.clock, self.sleep = clock, sleep
+        self.last_locked = None
+        self.last_cycle = None
+        self.fail_since = None
+        self.alerted_at = None
+
+    def step(self):
+        """확인 1회. 다음 확인까지 대기할 초를 돌려준다."""
+        cfg = self.cfg
+        try:
+            ensure_connected(cfg)
+            locked = device_locked(self.adb)
+        except Exception as e:
+            self._fail(e)
+            return cfg["lock_check_interval_sec"]
+
+        if locked is None:
+            log.warning("잠금 상태를 판별하지 못함 -> 풀려 있는 것으로 보고 진행 (탭 선택 검증이 보호)")
+        if locked:
+            if self.last_locked is not True:
+                log.info("잠금 상태 -> 사이클 대기")
+            self.fail_since = None
+        else:
+            just_unlocked = self.last_locked is True
+            due = (just_unlocked or self.last_cycle is None
+                   or self.clock() - self.last_cycle >= cfg["unlocked_cycle_interval_sec"])
+            if due:
+                if just_unlocked:
+                    log.info("잠금 해제 감지 -> %d초 뒤 사이클", cfg["unlock_settle_sec"])
+                    self.sleep(cfg["unlock_settle_sec"])
+                self.last_cycle = self.clock()
+                try:
+                    run_cycle(cfg, self.adb, "walk", self.notifier)
+                except NotCalibrated:
+                    raise
+                except Exception as e:
+                    self._fail(e)
+                else:
+                    self._ok()
+        self.last_locked = locked
+        return cfg["lock_check_interval_sec"]
+
+    def _ok(self):
+        if self.alerted_at is not None:
+            self.notifier.send("복구됨: 다시 정상 동작합니다.")
+            self.alerted_at = None
+        self.fail_since = None
+
+    def _fail(self, e):
+        log.exception("확인/사이클 실패")
+        now = self.clock()
+        if self.fail_since is None:
+            self.fail_since = now
+        if (now - self.fail_since >= self.cfg["alert_after_sec"]
+                and (self.alerted_at is None or now - self.alerted_at >= self.cfg["alert_repeat_sec"])):
+            first = (str(e).strip().splitlines() or [type(e).__name__])[0][:300]
+            self.notifier.send("%d분째 실패 중: %s" % ((now - self.fail_since) // 60, first))
+            self.alerted_at = now
+
+
 def prepare(cfg, adb):
     jar = (HERE / cfg["jar"]).resolve()
     if not jar.exists():
@@ -385,7 +478,7 @@ def load_config(path):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("cmd", choices=["run", "once", "discover", "check-guard"])
+    ap.add_argument("cmd", choices=["run", "once", "discover", "check-guard", "check-lock"])
     ap.add_argument("--config", default=str(HERE / "config.json"))
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args()
@@ -404,33 +497,28 @@ def main():
         print("물리 화면 Resumed 패키지:", sorted(foreground_packages_display0(adb)) or "(없음)")
         return
 
+    if args.cmd == "check-lock":
+        ensure_connected(cfg)
+        state = device_locked(adb)
+        print("폰 잠금 상태:", {True: "잠김", False: "풀림", None: "판별 불가"}[state])
+        return
+
     prepare(cfg, adb)
     try:
         if args.cmd in ("once", "discover"):
             r = run_cycle(cfg, adb, "discover" if args.cmd == "discover" else "walk", notifier)
             log.info("결과: %s", "건너뜀" if r is None else "%d개 열음" % r)
             return
-        notifier.send("데몬 시작 (폴링 %d초)" % cfg["poll_interval_sec"])
-        failures, alerted = 0, False
-        after, repeat = cfg["alert_after_failures"], cfg["alert_repeat_every"]
+        notifier.send("데몬 시작 (잠금 확인 %d초, 해제 중 사이클 %d초)"
+                      % (cfg["lock_check_interval_sec"], cfg["unlocked_cycle_interval_sec"]))
+        poller = Poller(cfg, adb, notifier)
         while True:
             try:
-                run_cycle(cfg, adb, "walk", notifier)
-                if alerted:
-                    notifier.send("복구됨: 사이클이 다시 정상 동작합니다.")
-                    alerted = False
-                failures = 0
+                wait = poller.step()
             except NotCalibrated as e:
                 notifier.send("설정 필요로 종료: %s" % e)
                 sys.exit("설정 필요: %s" % e)
-            except Exception as e:
-                failures += 1
-                log.exception("사이클 실패 (연속 %d회)", failures)
-                if failures == after or (failures > after and (failures - after) % repeat == 0):
-                    first = (str(e).strip().splitlines() or [type(e).__name__])[0][:300]
-                    notifier.send("사이클 연속 %d회 실패: %s" % (failures, first))
-                    alerted = True
-            time.sleep(cfg["poll_interval_sec"])
+            time.sleep(wait)
     except KeyboardInterrupt:
         log.info("종료")
 
