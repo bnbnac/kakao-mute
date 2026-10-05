@@ -44,8 +44,9 @@ DEFAULTS = {
     "unread_badge_id": None,
     "display_size": "1080x2340",
     "dpi": 420,
-    "lock_check_interval_sec": 30,
-    "unlocked_cycle_interval_sec": 180,
+    "lock_check_interval_sec": 60,
+    "unlocked_cycle_interval_sec": 600,
+    "min_cycle_gap_sec": 300,
     "unlock_settle_sec": 5,
     "launch_wait_sec": 4,
     "settle_sec": 1.2,
@@ -393,7 +394,9 @@ class Poller:
     """잠금 상태를 짧은 간격으로 확인하고, 풀려 있을 때만 사이클을 돌린다.
 
     - 잠겨 있으면 사이클을 돌리지 않는다 (입력이 무시되므로). 이건 실패가 아니다.
-    - 잠금이 풀린 직후 한 번, 이후 풀려 있는 동안 unlocked_cycle_interval_sec 마다 사이클을 돌린다.
+    - 잠금이 풀리면 사이클을 한 번 예약(pending)한다. 직전 사이클 이후 min_cycle_gap_sec 이 지났으면 바로,
+      아니면 지날 때까지 기다렸다가 (그 사이 다시 잠기면 취소) 돌린다. 해제를 자주 하는 날의 비용을 줄인다.
+    - 풀려 있는 동안에는 unlocked_cycle_interval_sec 마다 사이클을 돌린다.
     - 확인 자체나 사이클이 연속으로 alert_after_sec 이상 실패하면 알린다.
     """
 
@@ -401,6 +404,7 @@ class Poller:
         self.cfg, self.adb, self.notifier = cfg, adb, notifier
         self.clock, self.sleep = clock, sleep
         self.last_locked = None
+        self.pending_unlock = False
         self.last_cycle = None
         self.fail_since = None
         self.alerted_at = None
@@ -420,15 +424,19 @@ class Poller:
         if locked:
             if self.last_locked is not True:
                 log.info("잠금 상태 -> 사이클 대기")
+            self.pending_unlock = False
             self.fail_since = None
         else:
-            just_unlocked = self.last_locked is True
-            due = (just_unlocked or self.last_cycle is None
-                   or self.clock() - self.last_cycle >= cfg["unlocked_cycle_interval_sec"])
+            if self.last_locked is True:
+                self.pending_unlock = True
+            gap = None if self.last_cycle is None else self.clock() - self.last_cycle
+            unlock_due = self.pending_unlock and (gap is None or gap >= cfg["min_cycle_gap_sec"])
+            due = unlock_due or gap is None or gap >= cfg["unlocked_cycle_interval_sec"]
             if due:
-                if just_unlocked:
+                if unlock_due:
                     log.info("잠금 해제 감지 -> %d초 뒤 사이클", cfg["unlock_settle_sec"])
                     self.sleep(cfg["unlock_settle_sec"])
+                self.pending_unlock = False
                 self.last_cycle = self.clock()
                 try:
                     run_cycle(cfg, self.adb, "walk", self.notifier)

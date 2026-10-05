@@ -213,6 +213,38 @@ p.step()
 check("해제 중 간격 경과: 사이클 1회 더", len(cycles) == 2)
 check("step 반환값 = 잠금 확인 간격", p.step() == CFG["lock_check_interval_sec"])
 
+# 8-1b) 해제를 자주 해도 최소 간격(min_cycle_gap_sec) 안에서는 사이클이 안 돈다
+GAP = CFG["min_cycle_gap_sec"]
+Clock.t = 3000.0
+p, cycles, sleeps, _ = make_poller([False, True, False, False, False, False, False])
+p.step()                                   # 시작 시 풀림 -> 사이클 1회
+check("시작 시 사이클 1회", len(cycles) == 1)
+Clock.t += 60
+p.step()                                   # 잠김
+Clock.t += 60
+p.step()                                   # 다시 풀림 (직전 사이클 후 120초, 최소 간격 미만)
+check("최소 간격 안의 재해제: 사이클 안 돎", len(cycles) == 1 and p.pending_unlock is True)
+Clock.t += 60
+p.step()
+check("보류 중에도 간격 전에는 안 돎", len(cycles) == 1)
+Clock.t += GAP
+p.step()
+check("최소 간격 경과: 보류된 해제 사이클 실행", len(cycles) == 2 and p.pending_unlock is False)
+check("보류 사이클에도 안정화 대기", sleeps[-1] == CFG["unlock_settle_sec"])
+
+# 8-1c) 보류 중 다시 잠기면 보류는 취소된다
+Clock.t = 4000.0
+p, cycles, sleeps, _ = make_poller([False, True, False, True, True])
+p.step()
+Clock.t += 60
+p.step()                                   # 잠김
+Clock.t += 60
+p.step()                                   # 풀림 -> 보류
+check("재해제로 보류 생김", p.pending_unlock is True)
+Clock.t += 60
+p.step()                                   # 다시 잠김
+check("보류 중 잠기면 보류 취소", p.pending_unlock is False and len(cycles) == 1)
+
 # 8-2) 처음부터 풀려 있으면 안정화 대기 없이 바로 사이클
 Clock.t = 5000.0
 p, cycles, sleeps, _ = make_poller([False])
@@ -231,7 +263,7 @@ check("실패 직후엔 알림 없음", len(received) == 0)
 while Clock.t + CYC - 9000 < CFG["alert_after_sec"]:
     Clock.t += CYC
     p.step()
-check("기준 시간 전엔 알림 없음 (사이클이 계속 실패해도)", len(received) == 0 and len(cycles) > 3)
+check("기준 시간 전엔 알림 없음 (사이클이 계속 실패해도)", len(received) == 0 and len(cycles) >= 3)
 Clock.t += CYC
 p.step()
 check("기준 시간 경과: 실패 알림 1회", len(received) == 1 and "boom" in received[0][1]["content"])
