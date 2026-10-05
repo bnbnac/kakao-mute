@@ -103,6 +103,8 @@ SELECT host, now() - last_check_ok AS silent_for FROM kmute_heartbeat;
 
 DB 기록은 부가 기능이다. DSN이 없거나, 드라이버가 없거나, DB가 죽어도 읽음 처리는 그대로 동작하고 기록 실패는 경고만 남긴다 (실패하면 60초 동안 재시도하지 않는다). 다만 DB가 죽어 있는 동안에는 위 두 가지 효과(외부 감시, 재시작 후 복원)가 없다.
 
+알아둘 점: DB가 응답 없이 죽어 있으면 재시도할 때마다 연결 타임아웃(5초)만큼 데몬이 멈춘다 (재시도는 60초에 한 번이라 읽음 처리는 계속된다). DB가 복구되면 재시도 대기 뒤 자동으로 다시 연결하고, 테이블이 없으면 다시 만든다.
+
 ## 서버 운영
 
 [deploy/kakao-mute.service](deploy/kakao-mute.service)에 systemd 유닛 예시가 있다 (검증하지 않았다). 호스트는 **하나만** 돌린다. 두 호스트가 같은 폰에서 동시에 사이클을 돌리는 것을 막는 락은 없다.
@@ -126,18 +128,23 @@ DB 기록은 부가 기능이다. DSN이 없거나, 드라이버가 없거나, D
 - `adb tcpip 5555`가 Wi-Fi 전환 후에도 유지되고, Tailscale 경유로 모바일 데이터에서도 접속된다.
 - 물리 화면에서 카톡 사용 중임을 감지하는 가드 파서.
 - 폴링 로직은 가짜 폰/웹훅/DB 연결로 `tests/`에서 검증: 잠금 판별 파싱, 잠금 중 사이클 생략, "직전 확인 30분" 규칙, 건너뜀/실패 시 재시도 간격, 멈춤 감지, 가드 재확인, 시간 기준 알림과 복구, 재시작 시 직전 확인 시각 복원, DB 기록(실패해도 데몬이 계속 동작). 실기기에서는 `check-lock`이 잠김/풀림을 각각 맞게 판별하고, 풀린 상태에서 `Poller.step()` 1회가 사이클을 정상 실행하는 것을 확인했다. 잠금 → 해제 전환을 실기기에서 `run`으로 지켜보거나 며칠 돌려본 것은 아직 아니다.
+- **실제 Postgres**(Docker 일회용 컨테이너, `postgres:16-alpine`)로 확인: `check-db`, 하트비트/사이클 기록과 upsert 의미(ok만 `last_cycle_ok` 갱신, error는 `last_error`, skipped는 건드리지 않음), 새 프로세스에서 직전 확인 시각 복원과 재시작 후 30분 규칙 유지(`tests/test_postgres_integration.py`), DB를 중지해도 사이클이 계속 돌고 기록 실패가 예외로 번지지 않음, DB 복구 후 재연결과 스키마 재생성.
 
 확인하지 못함:
 - 수일 단위 장시간 폴링 안정성, 며칠 뒤에도 adb 인증이 유지되는지 (무선 디버깅 페어링이 8일 만에 풀린 사례가 있었다).
 - 상단 고정이 아닌 광고 채널에서의 안읽음순 정렬 동작과, 실제 광고 채널을 통한 읽음 처리 (친구 채팅으로만 확인).
 - 읽음 처리가 카톡 서버 쪽(다른 기기 세션)에 반영되는지: scrcpy 가상 디스플레이에서는 확인했지만 더미 Surface 경로에서는 직접 보지 않았다.
-- 실제 디스코드 웹훅 전송, systemd 유닛.
+- 실제 디스코드 웹훅 전송, systemd 유닛, 실제 디스코드/모니터링과 연동한 외부 감시 알림.
 
 ## 개발
 
 ```bash
 python tests/test_daemon.py   # 폰 없이 사이클/알림/잠금 판별 검증
 python tests/test_poller.py   # 폰/DB 없이 폴링 규칙과 DB 기록 검증
+
+# 실제 Postgres 통합 테스트 (일회용 DB 권장. DSN 이 없으면 건너뜀)
+docker run --rm -d --name kmute-pg-test -e POSTGRES_PASSWORD=<임시 비밀번호> -p 127.0.0.1:55432:5432 postgres:16-alpine
+KMUTE_TEST_DSN='postgresql://postgres:<임시 비밀번호>@127.0.0.1:55432/postgres' python tests/test_postgres_integration.py
 ```
 
 ## 출처
