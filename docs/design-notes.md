@@ -30,6 +30,20 @@
 
 shell 프로세스에서 `ActivityThread`를 리플렉션으로 만들면 `mConfigurationController`가 비어 있어서, 삼성의 `CompatSandbox.applyDisplaySandboxingIfNeeded`가 `ActivityThread.getConfiguration()`을 호출할 때 NPE가 나고 프로세스가 `Killed`된다. `ConfigurationController`를 만들어 채워 넣으면 해결된다 (`helper/VdTest.java`의 `systemContext()`).
 
+### 잠금 상태에서는 입력이 무시된다
+
+`adb shell input -d <id> tap`으로 가상 디스플레이의 폴더 탭을 눌렀을 때, 폰이 잠금(키가드) 상태이면 탭이 먹히지 않았다. 같은 좌표와 코드로 다음 결과를 얻었다.
+
+| 폰 상태 | 탭 결과 |
+|---|---|
+| 잠금 + 화면 꺼짐(Dozing) | 선택 안 됨 |
+| 잠금 + 화면 켜짐(Awake) | 선택 안 됨 |
+| 잠금 해제 + 화면 켜짐 | 선택됨 |
+
+UI 덤프(`uiautomator dump`)는 잠금 상태에서도 읽혔다. 입력 주입만 막힌다. 이 때문에 데몬은 탭 후 폴더 칩의 `selected` 속성을 확인하고, 선택되지 않으면 그 회차를 중단한다 (선택되지 않은 채 `전체` 목록을 처리하면 친구 채팅을 읽음 처리할 수 있기 때문이다).
+
+우회 후보 (모두 미검증): 접근성 액션(`performAction(ACTION_CLICK)`)으로 입력 주입을 거치지 않고 클릭하기, 잠금 해제된 동안에만 폴링하기, 잠금 정책 완화(보안상 비권장).
+
 ### 카톡이 이미 실행 중일 때
 
 `am start --display`가 `Activity not started, intent has been delivered to currently running top-most instance`를 출력한다. 관찰한 경우에는 태스크가 가상 디스플레이로 올라가고 물리 화면 포커스는 그대로였다. 하지만 사용자가 물리 화면에서 카톡을 쓰는 중에도 안전한지는 확인하지 못해서, 물리 화면에서 카톡이 Resumed면 그 회차를 건너뛰는 가드를 넣었다.

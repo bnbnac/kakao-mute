@@ -252,6 +252,13 @@ class Ui:
         self.adb.shell("input -d %d keyevent 4" % self.display)
 
 
+def folder_selected(root, folder_tab):
+    """폴더 탭 칩이 실제로 선택된 상태인가. 다른 탭(전체 등)의 목록을 광고로 오인하지 않기 위한 검사."""
+    return any(n.attrib.get("text") == folder_tab and
+               (n.attrib.get("selected") == "true" or n.attrib.get("checked") == "true")
+               for n in root.iter("node"))
+
+
 def chat_rows(root, name_id):
     names = [n for n in root.iter("node") if n.attrib.get("resource-id") == name_id and n.attrib.get("text")]
     names.sort(key=lambda n: parse_bounds(n.attrib["bounds"])[1])
@@ -297,11 +304,21 @@ def run_cycle(cfg, adb, mode="walk", notifier=None):
         tab = next((n for n in root.iter("node") if label(n) == cfg["folder_tab"]), None)
         if tab is None:
             raise CycleError("폴더 탭 '%s' 을 못 찾음 (채팅 탭이 아니거나 로그인/업데이트 화면)" % cfg["folder_tab"])
-        ui.tap_node(tab, root)
-        time.sleep(cfg["settle_sec"])
+        for _ in range(2):
+            ui.tap_node(tab, root)
+            time.sleep(cfg["settle_sec"])
+            root = ui.dump()
+            if folder_selected(root, cfg["folder_tab"]):
+                break
+            tab = next((n for n in root.iter("node") if label(n) == cfg["folder_tab"]), None)
+            if tab is None:
+                raise CycleError("폴더 탭 '%s' 이 사라짐" % cfg["folder_tab"])
+        else:
+            raise CycleError("폴더 탭 '%s' 을 눌렀지만 선택되지 않음. 다른 탭 목록을 처리하지 않도록 중단"
+                             % cfg["folder_tab"])
 
         if mode == "discover":
-            print_nodes(ui.dump())
+            print_nodes(root)
             return 0
 
         if not cfg["chat_name_id"]:

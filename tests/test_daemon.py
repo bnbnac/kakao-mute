@@ -37,7 +37,8 @@ CFG = dict(km.DEFAULTS, serial=None, chat_name_id="id/name", unread_badge_id="id
 def xml(rows, tab=True):
     out = ['<hierarchy>']
     if tab:
-        out.append('<node text="광고" resource-id="id/tab_chip" clickable="true" bounds="[0,0][100,100]"/>')
+        sel = "false" if tab == "off" else "true"
+        out.append('<node text="광고" resource-id="id/tab_chip" clickable="true" selected="%s" bounds="[0,0][100,100]"/>' % sel)
     y = 200
     for name, unread in rows:
         out.append('<node clickable="true" bounds="[0,%d][1080,%d]">' % (y, y + 150))
@@ -96,7 +97,8 @@ def check(name, cond):
 
 
 # 1) 정상: 안읽음 1개 -> 열고 -> 사라짐
-FakeUi.script, FakeUi.taps = [([("A", "3")], True), ([("A", "3")], True), ([("A", None)], True), ([("A", None)], True)], 0
+FakeUi.script, FakeUi.taps = [([("A", "3")], True), ([("A", "3")], True), ([("A", "3")], True),
+                              ([("A", None)], True), ([("A", None)], True)], 0
 r = km.run_cycle(CFG, None, "walk", n)
 check("정상 사이클: 1개 열고 종료", r == 1 and FakeUi.taps == 2)  # 탭: 폴더탭 + 채널
 
@@ -136,6 +138,15 @@ try:
 except km.CycleError:
     check("탭 없음 -> CycleError", True)
 check("예외에도 헬퍼 정리", FakeHelper.stopped == before + 1)
+
+# 4-2) 탭을 눌렀지만 선택되지 않음 -> 다른 탭 목록(친구 채팅 포함)을 처리하면 안 됨
+FakeUi.script, FakeUi.taps = [([("FRIEND", "5")], "off")], 0
+try:
+    km.run_cycle(CFG, None, "walk", n)
+    check("탭 선택 실패 -> 예외", False)
+except km.CycleError as e:
+    check("탭 선택 실패 -> CycleError", "선택되지 않음" in str(e))
+check("탭 선택 실패: 탭만 2번 누르고 채널은 열지 않음", FakeUi.taps == 2)
 
 # 5) 알림 미설정이면 조용히 로그만
 os_env = km.os.environ.pop("KMUTE_DISCORD_WEBHOOK", None)
