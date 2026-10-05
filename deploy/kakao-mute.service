@@ -1,0 +1,17 @@
+# systemd 유닛 예시. 검증하지 않았다. 경로와 사용자는 환경에 맞게 바꿀 것.
+# User 는 adb 키(~/.android)를 가진 사용자여야 하고, 그 키를 폰이 승인한 상태여야 한다.
+[Unit]
+Description=kakao-mute daemon
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=kakao-mute
+WorkingDirectory=/opt/kakao-mute
+ExecStart=/usr/bin/python3 /opt/kakao-mute/daemon/kakao_mute.py run
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target

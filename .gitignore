@@ -1,0 +1,4 @@
+helper/build/
+daemon/config.json
+daemon/*.log*
+__pycache__/
