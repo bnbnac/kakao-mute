@@ -6,7 +6,8 @@
   -> 카톡 실행 -> 폴더 탭 -> 맨 위 행에 안읽음이 있으면 열고 닫기를 반복 -> 디스플레이 해제
 
 서브커맨드:
-  run        폴링 루프: 잠금 상태를 짧은 간격으로 확인하고, 풀려 있을 때만 사이클을 돌린다
+  run        폴링 루프: 잠금 상태를 짧은 간격으로 확인하고, 풀려 있고 직전 확인이 오래됐을 때만 사이클을 돌린다
+  check-db   Postgres 연결, 스키마 생성, 하트비트 기록/읽기 확인 (KMUTE_DB_DSN 필요)
   once       사이클 1회 (잠금 확인 없이)
   check-lock 폰의 잠금 상태 출력
   discover   폴더 탭까지만 열고 목록의 노드(resource-id/bounds)를 출력. 채널 행은 열지 않는다.
@@ -31,6 +32,8 @@ import urllib.request
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
+import kmute_store
+
 HERE = Path(__file__).resolve().parent
 REMOTE_JAR = "/data/local/tmp/vdtest.jar"
 
@@ -45,9 +48,10 @@ DEFAULTS = {
     "display_size": "1080x2340",
     "dpi": 420,
     "lock_check_interval_sec": 60,
-    "unlocked_cycle_interval_sec": 600,
-    "min_cycle_gap_sec": 300,
+    "check_interval_sec": 1800,
+    "retry_gap_sec": 300,
     "unlock_settle_sec": 5,
+    "db_dsn": "",
     "launch_wait_sec": 4,
     "settle_sec": 1.2,
     "dwell_sec": 3,
@@ -390,24 +394,39 @@ def run_cycle(cfg, adb, mode="walk", notifier=None):
         log.info("가상 디스플레이 해제")
 
 
+def first_line(e):
+    return (str(e).strip().splitlines() or [type(e).__name__])[0][:300]
+
+
 class Poller:
-    """잠금 상태를 짧은 간격으로 확인하고, 풀려 있을 때만 사이클을 돌린다.
+    """잠금 상태를 짧은 간격으로 확인하고, 풀려 있고 직전 확인이 충분히 오래됐을 때만 사이클을 돌린다.
 
     - 잠겨 있으면 사이클을 돌리지 않는다 (입력이 무시되므로). 이건 실패가 아니다.
-    - 잠금이 풀리면 사이클을 한 번 예약(pending)한다. 직전 사이클 이후 min_cycle_gap_sec 이 지났으면 바로,
-      아니면 지날 때까지 기다렸다가 (그 사이 다시 잠기면 취소) 돌린다. 해제를 자주 하는 날의 비용을 줄인다.
-    - 풀려 있는 동안에는 unlocked_cycle_interval_sec 마다 사이클을 돌린다.
+    - **직전 확인(성공한 사이클)이 check_interval_sec 이상 전일 때만** 사이클을 돌린다. 몇 시간 잠겨 있다가
+      풀리면 마지막 확인이 오래됐으니 자연스럽게 바로 돌고, 해제를 자주 해도 그 시간 안에는 다시 안 돈다.
+    - 직전 확인 시각은 DB 에 저장해 두었다가 시작할 때 복원한다 (재시작이 즉시 확인을 일으키지 않게).
+    - 사이클이 실패했거나 건너뛰어졌으면(물리 화면에서 카톡 사용 중) 확인한 것이 아니므로 직전 확인 시각을
+      갱신하지 않고, retry_gap_sec 뒤에 다시 시도한다.
     - 확인 자체나 사이클이 연속으로 alert_after_sec 이상 실패하면 알린다.
     """
 
-    def __init__(self, cfg, adb, notifier, clock=time.time, sleep=time.sleep):
+    def __init__(self, cfg, adb, notifier, store=None, clock=time.time, sleep=time.sleep):
         self.cfg, self.adb, self.notifier = cfg, adb, notifier
+        self.store = store or kmute_store.NullStore()
         self.clock, self.sleep = clock, sleep
         self.last_locked = None
-        self.pending_unlock = False
-        self.last_cycle = None
+        self.last_attempt = None
         self.fail_since = None
         self.alerted_at = None
+        self.last_ok = self._restore_last_ok()
+
+    def _restore_last_ok(self):
+        ts = self.store.load_last_cycle_ok()
+        now = self.clock()
+        if ts is None or ts > now + 60:
+            return None
+        log.info("DB 에서 직전 확인 시각 복원: %d분 전", (now - ts) // 60)
+        return ts
 
     def step(self):
         """확인 1회. 다음 확인까지 대기할 초를 돌려준다."""
@@ -421,33 +440,43 @@ class Poller:
 
         if locked is None:
             log.warning("잠금 상태를 판별하지 못함 -> 풀려 있는 것으로 보고 진행 (탭 선택 검증이 보호)")
+        self.store.heartbeat(locked)
         if locked:
             if self.last_locked is not True:
                 log.info("잠금 상태 -> 사이클 대기")
-            self.pending_unlock = False
             self.fail_since = None
         else:
-            if self.last_locked is True:
-                self.pending_unlock = True
-            gap = None if self.last_cycle is None else self.clock() - self.last_cycle
-            unlock_due = self.pending_unlock and (gap is None or gap >= cfg["min_cycle_gap_sec"])
-            due = unlock_due or gap is None or gap >= cfg["unlocked_cycle_interval_sec"]
+            now = self.clock()
+            ok_age = None if self.last_ok is None else now - self.last_ok
+            try_age = None if self.last_attempt is None else now - self.last_attempt
+            due = ((ok_age is None or ok_age >= cfg["check_interval_sec"])
+                   and (try_age is None or try_age >= cfg["retry_gap_sec"]))
             if due:
-                if unlock_due:
+                if self.last_locked is True:
                     log.info("잠금 해제 감지 -> %d초 뒤 사이클", cfg["unlock_settle_sec"])
                     self.sleep(cfg["unlock_settle_sec"])
-                self.pending_unlock = False
-                self.last_cycle = self.clock()
-                try:
-                    run_cycle(cfg, self.adb, "walk", self.notifier)
-                except NotCalibrated:
-                    raise
-                except Exception as e:
-                    self._fail(e)
-                else:
-                    self._ok()
+                self._cycle()
         self.last_locked = locked
         return cfg["lock_check_interval_sec"]
+
+    def _cycle(self):
+        started = self.clock()
+        self.last_attempt = started
+        try:
+            opened = run_cycle(self.cfg, self.adb, "walk", self.notifier)
+        except NotCalibrated:
+            raise
+        except Exception as e:
+            self.store.record_cycle(started, self.clock() - started, "error", error=first_line(e))
+            self._fail(e)
+            return
+        duration = self.clock() - started
+        if opened is None:
+            self.store.record_cycle(started, duration, "skipped")
+            return
+        self.last_ok = self.clock()
+        self.store.record_cycle(started, duration, "ok", opened=opened)
+        self._ok()
 
     def _ok(self):
         if self.alerted_at is not None:
@@ -457,13 +486,13 @@ class Poller:
 
     def _fail(self, e):
         log.exception("확인/사이클 실패")
+        self.store.note_error(first_line(e))
         now = self.clock()
         if self.fail_since is None:
             self.fail_since = now
         if (now - self.fail_since >= self.cfg["alert_after_sec"]
                 and (self.alerted_at is None or now - self.alerted_at >= self.cfg["alert_repeat_sec"])):
-            first = (str(e).strip().splitlines() or [type(e).__name__])[0][:300]
-            self.notifier.send("%d분째 실패 중: %s" % ((now - self.fail_since) // 60, first))
+            self.notifier.send("%d분째 실패 중: %s" % ((now - self.fail_since) // 60, first_line(e)))
             self.alerted_at = now
 
 
@@ -486,7 +515,7 @@ def load_config(path):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("cmd", choices=["run", "once", "discover", "check-guard", "check-lock"])
+    ap.add_argument("cmd", choices=["run", "once", "discover", "check-guard", "check-lock", "check-db"])
     ap.add_argument("--config", default=str(HERE / "config.json"))
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args()
@@ -499,6 +528,15 @@ def main():
     cfg = load_config(args.config)
     adb = Adb(cfg["serial"])
     notifier = Notifier(cfg)
+    dsn = os.environ.get("KMUTE_DB_DSN") or cfg.get("db_dsn") or ""
+    store = kmute_store.Store(dsn) if dsn else kmute_store.NullStore()
+
+    if args.cmd == "check-db":
+        if not dsn:
+            sys.exit("DSN 이 없음. 환경변수 KMUTE_DB_DSN 또는 config 의 db_dsn 을 설정하세요.")
+        rows = store.selftest()
+        print("DB 연결/스키마/하트비트 기록 확인 OK:", rows)
+        return
 
     if args.cmd == "check-guard":
         ensure_connected(cfg)
@@ -517,9 +555,10 @@ def main():
             r = run_cycle(cfg, adb, "discover" if args.cmd == "discover" else "walk", notifier)
             log.info("결과: %s", "건너뜀" if r is None else "%d개 열음" % r)
             return
-        notifier.send("데몬 시작 (잠금 확인 %d초, 해제 중 사이클 %d초)"
-                      % (cfg["lock_check_interval_sec"], cfg["unlocked_cycle_interval_sec"]))
-        poller = Poller(cfg, adb, notifier)
+        notifier.send("데몬 시작 (잠금 확인 %d초, 직전 확인이 %d분 이상 전일 때만 확인, DB %s)"
+                      % (cfg["lock_check_interval_sec"], cfg["check_interval_sec"] // 60,
+                         "사용" if store.enabled else "미사용"))
+        poller = Poller(cfg, adb, notifier, store)
         while True:
             try:
                 wait = poller.step()
