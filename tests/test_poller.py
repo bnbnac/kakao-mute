@@ -149,6 +149,82 @@ check("건너뜀 후 retry_gap 뒤 재시도 (30분 기다리지 않음)", len(c
 advance(p, RETRY)
 check("성공하면 직전 확인 시각 갱신, 이후 30분 규칙", p.last_ok is not None and len(calls) == 3)
 
+# 6-2) 실제 run_cycle 로 통합: 안읽음을 발견했는데 가드로 중단되면 확인한 게 아니다 (30분 대기 금지)
+import xml.etree.ElementTree as _ET
+
+
+def _tree(rows):
+    out = ['<hierarchy><node text="광고" resource-id="id/tab_chip" clickable="true" selected="true" bounds="[0,0][100,100]"/>']
+    y = 200
+    for name, unread in rows:
+        out.append('<node clickable="true" bounds="[0,%d][1080,%d]">' % (y, y + 150))
+        out.append('<node text="%s" resource-id="id/name" bounds="[0,%d][100,%d]"/>' % (name, y, y + 50))
+        if unread:
+            out.append('<node text="%s" resource-id="id/unread" bounds="[0,%d][50,%d]"/>' % (unread, y + 60, y + 100))
+        out.append('</node>')
+        y += 150
+    out.append('</hierarchy>')
+    return _ET.fromstring("".join(out))
+
+
+class _Helper:
+    def __init__(self, *a):
+        pass
+
+    def wait_display_id(self, timeout=20):
+        return 9
+
+    def stop(self):
+        pass
+
+
+class _Ui:
+    taps = 0
+
+    def __init__(self, adb, display):
+        pass
+
+    def dump(self):
+        return _tree([("AD", "2")])
+
+    def tap_node(self, node, root):
+        _Ui.taps += 1
+
+    def back(self):
+        pass
+
+
+import importlib
+importlib.reload(km)               # run_cycle 를 가짜로 바꾼 것을 원래대로 되돌린다
+km.Helper, km.Ui = _Helper, _Ui
+km.ensure_connected = lambda cfg: None
+km.time.sleep = lambda s: None
+CFG2 = dict(km.DEFAULTS, serial=None, chat_name_id="id/name", unread_badge_id="id/unread", settle_sec=0,
+            dwell_sec=0, launch_wait_sec=0)
+state = {"blocked_after": 0, "calls": 0}
+
+
+def _guard(cfg, adb):
+    state["calls"] += 1
+    return set() if state["calls"] == 1 else {"com.kakao.talk"}    # 시작 가드는 통과, 열기 직전에는 사용 중
+
+
+km.guard_blocked = _guard
+km.device_locked = lambda adb: False
+Clock.t = 100000.0
+notif2 = Notif()
+p = km.Poller(CFG2, None, notif2, FakeStore(), clock=Clock.now, sleep=lambda s: None)
+p.step()
+check("가드로 중단된 사이클은 직전 확인 시각을 갱신하지 않음", p.last_ok is None and _Ui.taps == 1)
+check("가드로 중단된 사이클은 DB 에 skipped 로 기록", p.store.cycles and p.store.cycles[-1][0] == "skipped")
+advance(p, RETRY - TICK)
+check("retry_gap 전에는 재시도 안 함", state["calls"] == 2 and p.last_ok is None)
+state["calls"] = 0
+km.guard_blocked = lambda cfg, adb: set()            # 사용자가 카톡에서 나감
+_Ui.taps = 0
+advance(p, TICK)
+check("retry_gap 뒤 재시도 (30분 기다리지 않음)", _Ui.taps >= 1)
+
 # 7) 사이클 실패: retry_gap 마다 재시도, 시간 기준 알림, 성공하면 복구 알림
 Clock.t = 100000.0
 fail = km.CycleError("boom")

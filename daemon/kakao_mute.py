@@ -51,6 +51,9 @@ DEFAULTS = {
     "check_interval_sec": 1800,
     "retry_gap_sec": 300,
     "unlock_settle_sec": 5,
+    "late_wait_sec": 8,
+    "tab_attempts": 2,
+    "failure_dump": "last_failure_dump.xml",
     "db_dsn": "",
     "launch_wait_sec": 4,
     "settle_sec": 1.2,
@@ -77,6 +80,10 @@ class CycleError(Exception):
 
 class NotCalibrated(Exception):
     pass
+
+
+class ForeignScreen(Exception):
+    """가상 디스플레이 대신 다른 앱(물리 화면에서 사용자가 쓰는 앱)의 UI 가 덤프로 돌아왔다."""
 
 
 class Adb:
@@ -117,21 +124,32 @@ def ensure_connected(cfg):
     raise AdbError("폰에 접속할 수 없음: %s" % serial)
 
 
-def foreground_packages_display0(adb):
-    """기본(물리) 디스플레이에서 Resumed 상태인 패키지 집합."""
-    text = adb.shell("dumpsys activity activities", timeout=30)
+def parse_display0_resumed(text):
+    """`dumpsys activity activities` 출력에서 기본(물리) 디스플레이에서 Resumed 상태인 패키지 집합.
+
+    디스플레이별 값은 `topResumedActivity=` 와 `Resumed:` 만 쓴다. 마지막 디스플레이 구역 끝에는 전역
+    `ResumedActivity:` 줄(포커스를 가진 디스플레이의 앱)이 붙어 있어서, 포커스가 가상 디스플레이에 있으면
+    그 줄을 물리 화면의 것으로 오인하게 된다. 그래서 이 패턴은 일부러 쓰지 않는다.
+    """
     pkgs, cur = set(), None
     for line in text.splitlines():
-        m = re.match(r"\s*Display #(\d+) \(", line)
+        m = re.match(r"Display #(\d+) \(", line)
         if m:
             cur = int(m.group(1))
             continue
+        if line and not line[0].isspace():
+            cur = None
+            continue
         if cur != 0:
             continue
-        m = re.search(r"(?:Resumed:|topResumedActivity=|ResumedActivity:)\s*ActivityRecord\{\S+ u\d+ ([\w.]+)/", line)
+        m = re.search(r"(?:\bResumed:|topResumedActivity=)\s*ActivityRecord\{\S+ u\d+ ([\w.]+)/", line)
         if m:
             pkgs.add(m.group(1))
     return pkgs
+
+
+def foreground_packages_display0(adb):
+    return parse_display0_resumed(adb.shell("dumpsys activity activities", timeout=30))
 
 
 def device_locked(adb):
@@ -260,6 +278,25 @@ def clickable_ancestor(n, parents):
     return n
 
 
+KAKAO_PACKAGE = "com.kakao.talk"
+# 가상 디스플레이의 덤프에는 카톡 노드와 함께 시스템 UI(내비게이션 바)가 항상 섞여 있고, 카톡이 뜨기 전에는
+# 시스템 UI 나 런처만 보일 수 있다. 이들은 "다른 앱"으로 치지 않는다 (로딩 중과 구분하기 위해).
+NEUTRAL_PACKAGES = {"com.android.systemui", "com.sec.android.app.launcher", "android"}
+
+
+def foreign_packages(root):
+    """카톡 노드가 없고 중립이 아닌 다른 앱 노드가 있으면 그 패키지 목록을, 아니면 None 을 돌려준다.
+
+    실패 사례: 사용자가 물리 화면에서 배터리(com.samsung.android.lool)나 Tailscale 을 보고 있을 때
+    `uiautomator dump --display N` 이 N 번이 아니라 그 앱의 트리를 돌려줬다.
+    """
+    packages = {n.attrib.get("package") for n in root.iter("node") if n.attrib.get("package")}
+    if KAKAO_PACKAGE in packages:
+        return None
+    others = sorted(packages - NEUTRAL_PACKAGES)
+    return others or None
+
+
 class Ui:
     def __init__(self, adb, display):
         self.adb = adb
@@ -269,7 +306,11 @@ class Ui:
         path = "/sdcard/kmute_dump.xml"
         self.adb.shell("uiautomator dump --display %d %s" % (self.display, path))
         xml = self.adb.run("exec-out", "cat", path).strip()
-        return ET.fromstring(xml)
+        root = ET.fromstring(xml)
+        others = foreign_packages(root)
+        if others:
+            raise ForeignScreen(",".join(others))
+        return root
 
     def tap_node(self, node, root):
         target = clickable_ancestor(node, parent_map(root))
@@ -313,6 +354,56 @@ def print_nodes(root):
                                                     n.attrib.get("bounds"), cb))
 
 
+def find_folder_tab(root, cfg):
+    return next((n for n in root.iter("node") if label(n) == cfg["folder_tab"]), None)
+
+
+def find_chat_tab(root):
+    """카톡 하단의 '채팅 탭' (접근성 라벨이 '채팅 탭' 또는 '채팅 탭 N개의 새로운 업데이트')."""
+    return next((n for n in root.iter("node") if n.attrib.get("content-desc", "").startswith("채팅 탭")), None)
+
+
+def save_failure_dump(root, cfg):
+    """원인을 볼 수 있게 마지막 UI 덤프를 로컬 파일로 남긴다. 채팅 이름이 들어 있어 gitignore 대상이다."""
+    path = (HERE / cfg["failure_dump"]).resolve()
+    try:
+        path.write_text(ET.tostring(root, encoding="unicode"), encoding="utf-8")
+        return str(path)
+    except OSError as e:
+        log.warning("실패 덤프 저장 실패: %s", e)
+        return None
+
+
+def reach_folder_tab(ui, cfg):
+    """카톡이 뜬 뒤 폴더 탭이 보이는 화면까지 간다. (루트, 탭 노드)를 돌려준다.
+
+    덤프는 폰의 비용이 크므로 폴링하지 않는다. 평소에는 launch_wait_sec 뒤 덤프 1번으로 끝나고,
+    탭이 없을 때만 최대 tab_attempts 번 더 덤프한다. 그때마다
+    - 하단 '채팅 탭'이 보이면 다른 하단 탭(친구 등)에 있는 것이니 채팅 탭을 눌러 이동하고,
+    - 하단 탭도 안 보이면 아직 로딩 중(콜드 스타트)으로 보고 late_wait_sec 동안 기다린다.
+    끝내 못 찾으면 마지막 덤프를 저장하고 실패한다.
+    """
+    root = ui.dump()
+    for attempt in range(cfg["tab_attempts"] + 1):
+        tab = find_folder_tab(root, cfg)
+        if tab is not None:
+            return root, tab
+        if attempt == cfg["tab_attempts"]:
+            break
+        chat = find_chat_tab(root)
+        if chat is not None:
+            log.info("폴더 탭이 안 보이고 하단 채팅 탭이 보임 -> 채팅 탭으로 이동")
+            ui.tap_node(chat, root)
+            time.sleep(cfg["settle_sec"])
+        else:
+            log.info("폴더 탭도 하단 탭도 안 보임 -> 로딩 중으로 보고 %d초 대기", cfg["late_wait_sec"])
+            time.sleep(cfg["late_wait_sec"])
+        root = ui.dump()
+    saved = save_failure_dump(root, cfg)
+    raise CycleError("폴더 탭 '%s' 을 못 찾음 (채팅 화면이 아니거나 로딩/로그인/업데이트 화면). 마지막 UI 덤프: %s"
+                     % (cfg["folder_tab"], saved or "저장 실패"))
+
+
 def run_cycle(cfg, adb, mode="walk", notifier=None):
     ensure_connected(cfg)
 
@@ -328,10 +419,7 @@ def run_cycle(cfg, adb, mode="walk", notifier=None):
         ui = Ui(adb, display)
         time.sleep(cfg["launch_wait_sec"])
 
-        root = ui.dump()
-        tab = next((n for n in root.iter("node") if label(n) == cfg["folder_tab"]), None)
-        if tab is None:
-            raise CycleError("폴더 탭 '%s' 을 못 찾음 (채팅 탭이 아니거나 로그인/업데이트 화면)" % cfg["folder_tab"])
+        root, tab = reach_folder_tab(ui, cfg)
         for _ in range(2):
             ui.tap_node(tab, root)
             time.sleep(cfg["settle_sec"])
@@ -354,6 +442,7 @@ def run_cycle(cfg, adb, mode="walk", notifier=None):
 
         opened = 0
         prev = None
+        interrupted = False
         while opened < cfg["max_open_per_cycle"]:
             root = ui.dump()
             rows = chat_rows(root, cfg["chat_name_id"])
@@ -373,6 +462,7 @@ def run_cycle(cfg, adb, mode="walk", notifier=None):
             blocked = guard_blocked(cfg, adb)
             if blocked:
                 log.info("열기 직전 가드: 물리 화면에서 사용 중(%s) -> 중단", ",".join(sorted(blocked)))
+                interrupted = True
                 break
             log.info("열기: %s", name)
             ui.tap_node(top, root)
@@ -388,7 +478,12 @@ def run_cycle(cfg, adb, mode="walk", notifier=None):
                 time.sleep(cfg["settle_sec"])
         else:
             log.warning("회차 상한(%d) 도달, 안읽음이 남아있을 수 있음", cfg["max_open_per_cycle"])
-        return opened
+        # 안읽음을 발견하고도 가드로 중단됐으면 확인을 끝내지 못한 것이다. None(건너뜀)으로 돌려줘
+        # 직전 확인 시각이 갱신되지 않고 retry_gap_sec 뒤에 다시 시도하게 한다.
+        return None if interrupted else opened
+    except ForeignScreen as e:
+        log.info("가상 디스플레이 대신 다른 앱 화면(%s)이 덤프됨 -> 사용자가 폰을 쓰는 중으로 보고 이번 회차 건너뜀", e)
+        return None
     finally:
         helper.stop()
         log.info("가상 디스플레이 해제")
