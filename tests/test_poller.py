@@ -345,19 +345,19 @@ s, log, connects = store_with()
 check("하트비트 기록 성공", s.heartbeat(False) is True)
 sqls = [q for q, _ in log]
 check("첫 기록 전에 스키마 생성(테이블 2개)", sum("CREATE TABLE IF NOT EXISTS" in q for q in sqls) == 2)
-check("하트비트 upsert 파라미터 (host, 시각, 잠금)", log[-1][1] == ("h1", Clock.t, False) and "kmute_heartbeat" in log[-1][0])
+check("하트비트 upsert 파라미터 (host, 시각, 잠금)", log[-1][1] == ("h1", Clock.t, False) and "heartbeat" in log[-1][0])
 s.heartbeat(True)
 check("스키마는 한 번만 생성, 연결도 재사용", sum("CREATE TABLE" in q for q, _ in log) == 2 and len(connects) == 1)
 
 s, log, _ = store_with()
 s.record_cycle(100.0, 12.345, "ok", opened=2)
 kinds = [q for q, _ in log if "INSERT" in q]
-check("ok 사이클: cycles 기록 + last_cycle_ok 갱신", len(kinds) == 2 and "kmute_cycles" in kinds[0] and "last_cycle_ok" in kinds[1])
+check("ok 사이클: cycles 기록 + last_cycle_ok 갱신", len(kinds) == 2 and "cycle_log" in kinds[0] and "last_cycle_ok" in kinds[1])
 check("ok 사이클 파라미터(소요 시간 반올림, 열린 수)", log[-2][1] == ("h1", 100.0, 12.35, "ok", 2, None))
 s, log, _ = store_with()
 s.record_cycle(100.0, 1.0, "skipped")
 kinds = [q for q, _ in log if "INSERT" in q]
-check("skipped 사이클: cycles 만 기록, last_cycle_ok 는 건드리지 않음", len(kinds) == 1 and "kmute_cycles" in kinds[0])
+check("skipped 사이클: cycles 만 기록, last_cycle_ok 는 건드리지 않음", len(kinds) == 1 and "cycle_log" in kinds[0])
 s, log, _ = store_with()
 s.record_cycle(100.0, 1.0, "error", error="boom")
 kinds = [q for q, _ in log if "INSERT" in q]
@@ -370,7 +370,7 @@ check("실패 직후 retry_sec 안에는 재연결 시도 안 함", len(connects
 Clock.t += 61
 check("retry_sec 뒤 재연결 성공", s.heartbeat(True) is True and len(connects) == 2)
 
-s, log, connects = store_with(fail_on="kmute_heartbeat (host, last_check_ok")
+s, log, connects = store_with(fail_on="heartbeat (host, last_check_ok")
 check("쿼리 실패도 삼킴", s.heartbeat(True) is False)
 check("쿼리 실패 시 연결을 버리고 대기", s.conn is None and s.down_until > Clock.t)
 

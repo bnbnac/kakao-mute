@@ -43,11 +43,11 @@ def query(sql, params=()):
 
 
 def hb():
-    return query("SELECT last_check_ok, last_cycle_ok, locked, last_error FROM kmute_heartbeat WHERE host=%s", (HOST,))
+    return query("SELECT last_check_ok, last_cycle_ok, locked, last_error FROM heartbeat WHERE host=%s", (HOST,))
 
 
 def cycles():
-    return query("SELECT result, opened, error, duration_sec FROM kmute_cycles WHERE host=%s ORDER BY id", (HOST,))
+    return query("SELECT result, opened, error, duration_sec FROM cycle_log WHERE host=%s ORDER BY id", (HOST,))
 
 
 try:
@@ -99,12 +99,12 @@ try:
     check("Poller#2(재시작): DB 에서 직전 확인 시각 복원", p2.last_ok is not None and abs(p2.last_ok - p1.last_ok) < 5)
     p2.step()
     check("재시작 직후에도 30분 규칙 유지: 사이클 안 돌림", len(cycle_calls) == 1)
-    check("Poller 하트비트가 DB 에 기록됨", query("SELECT locked FROM kmute_heartbeat WHERE host=%s", (HOST2,))[0][0] is False)
-    check("Poller 사이클 로그가 DB 에 기록됨", query("SELECT count(*) FROM kmute_cycles WHERE host=%s", (HOST2,))[0][0] == 1)
+    check("Poller 하트비트가 DB 에 기록됨", query("SELECT locked FROM heartbeat WHERE host=%s", (HOST2,))[0][0] is False)
+    check("Poller 사이클 로그가 DB 에 기록됨", query("SELECT count(*) FROM cycle_log WHERE host=%s", (HOST2,))[0][0] == 1)
 finally:
     for h in (HOST, HOST + "-poller"):
-        query("DELETE FROM kmute_cycles WHERE host=%s", (h,))
-        query("DELETE FROM kmute_heartbeat WHERE host=%s", (h,))
+        query("DELETE FROM cycle_log WHERE host=%s", (h,))
+        query("DELETE FROM heartbeat WHERE host=%s", (h,))
 
 print("ALL PASS" if ok else "SOME FAILED")
 sys.exit(0 if ok else 1)

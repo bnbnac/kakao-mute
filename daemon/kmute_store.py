@@ -6,7 +6,7 @@
 2. "직전 확인이 충분히 오래됐을 때만 확인한다"는 규칙의 상태(직전 확인 시각)를 저장해, 데몬이 재시작돼도
    규칙이 유지되게 한다 (재시작이나 크래시 루프가 매번 즉시 확인을 일으키지 않게).
 
-- 감시 기준은 `kmute_heartbeat.last_check_ok` (데몬 생존 + 폰 접속). `last_cycle_ok` 는 통계용이다.
+- 감시 기준은 `heartbeat.last_check_ok` (데몬 생존 + 폰 접속). `last_cycle_ok` 는 통계용이다.
   폰이 잠겨 있으면 사이클이 안 도는 것이 정상이라 last_cycle_ok 로는 이상을 판단할 수 없다.
 - 이 기능은 부가 기능이다. DSN 이 없거나, 드라이버가 없거나, DB 가 죽어도 데몬은 계속 동작해야 한다.
   모든 DB 오류는 삼키고 경고만 남기며, 실패하면 retry_sec 동안 재시도하지 않는다.
@@ -19,7 +19,7 @@ import time
 log = logging.getLogger("kmute.store")
 
 SCHEMA = [
-    """CREATE TABLE IF NOT EXISTS kmute_heartbeat (
+    """CREATE TABLE IF NOT EXISTS heartbeat (
         host text PRIMARY KEY,
         last_check_ok timestamptz,
         last_cycle_ok timestamptz,
@@ -27,7 +27,7 @@ SCHEMA = [
         last_error text,
         updated_at timestamptz NOT NULL DEFAULT now()
     )""",
-    """CREATE TABLE IF NOT EXISTS kmute_cycles (
+    """CREATE TABLE IF NOT EXISTS cycle_log (
         id bigserial PRIMARY KEY,
         host text NOT NULL,
         started_at timestamptz NOT NULL,
@@ -38,27 +38,27 @@ SCHEMA = [
     )""",
 ]
 
-SQL_HEARTBEAT = """INSERT INTO kmute_heartbeat (host, last_check_ok, locked, updated_at)
+SQL_HEARTBEAT = """INSERT INTO heartbeat (host, last_check_ok, locked, updated_at)
 VALUES (%s, to_timestamp(%s), %s, now())
 ON CONFLICT (host) DO UPDATE SET last_check_ok = EXCLUDED.last_check_ok,
     locked = EXCLUDED.locked, updated_at = now()"""
 
-SQL_CYCLE = """INSERT INTO kmute_cycles (host, started_at, duration_sec, result, opened, error)
+SQL_CYCLE = """INSERT INTO cycle_log (host, started_at, duration_sec, result, opened, error)
 VALUES (%s, to_timestamp(%s), %s, %s, %s, %s)"""
 
-SQL_CYCLE_OK = """INSERT INTO kmute_heartbeat (host, last_cycle_ok, last_error, updated_at)
+SQL_CYCLE_OK = """INSERT INTO heartbeat (host, last_cycle_ok, last_error, updated_at)
 VALUES (%s, to_timestamp(%s), NULL, now())
 ON CONFLICT (host) DO UPDATE SET last_cycle_ok = EXCLUDED.last_cycle_ok,
     last_error = NULL, updated_at = now()"""
 
-SQL_ERROR = """INSERT INTO kmute_heartbeat (host, last_error, updated_at)
+SQL_ERROR = """INSERT INTO heartbeat (host, last_error, updated_at)
 VALUES (%s, %s, now())
 ON CONFLICT (host) DO UPDATE SET last_error = EXCLUDED.last_error, updated_at = now()"""
 
 SQL_SELECT = """SELECT host, last_check_ok, last_cycle_ok, locked, last_error
-FROM kmute_heartbeat WHERE host = %s"""
+FROM heartbeat WHERE host = %s"""
 
-SQL_LAST_OK = "SELECT extract(epoch FROM last_cycle_ok) FROM kmute_heartbeat WHERE host = %s"
+SQL_LAST_OK = "SELECT extract(epoch FROM last_cycle_ok) FROM heartbeat WHERE host = %s"
 
 
 def default_connect(dsn):

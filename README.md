@@ -92,13 +92,13 @@ python daemon/kakao_mute.py check-db            # 연결, 테이블 생성, 하�
 
 | 테이블 | 내용 |
 |---|---|
-| `kmute_heartbeat` (호스트당 1행) | `last_check_ok` 마지막 확인 성공(데몬 생존 + 폰 접속), `last_cycle_ok` 마지막 사이클 성공, `locked`, `last_error` |
-| `kmute_cycles` | 사이클마다 한 행: 시작 시각, 소요 시간, `result`(ok/skipped/error), 연 채널 수, 오류 |
+| `heartbeat` (호스트당 1행) | `last_check_ok` 마지막 확인 성공(데몬 생존 + 폰 접속), `last_cycle_ok` 마지막 사이클 성공, `locked`, `last_error` |
+| `cycle_log` | 사이클마다 한 행: 시작 시각, 소요 시간, `result`(ok/skipped/error), 연 채널 수, 오류 |
 
 **외부 감시는 `last_check_ok` 기준으로 건다.** 폰이 잠겨 있는 동안은 사이클이 안 도는 것이 정상이라 `last_cycle_ok`가 오래됐다고 이상으로 보면 오탐이다. 예를 들어 이런 조회가 N분 이상이면 알린다 (잠금 확인 간격의 몇 배로).
 
 ```sql
-SELECT host, now() - last_check_ok AS silent_for FROM kmute_heartbeat;
+SELECT host, now() - last_check_ok AS silent_for FROM heartbeat;
 ```
 
 DB 기록은 부가 기능이다. DSN이 없거나, 드라이버가 없거나, DB가 죽어도 읽음 처리는 그대로 동작하고 기록 실패는 경고만 남긴다 (실패하면 60초 동안 재시도하지 않는다). 다만 DB가 죽어 있는 동안에는 위 두 가지 효과(외부 감시, 재시작 후 복원)가 없다.
