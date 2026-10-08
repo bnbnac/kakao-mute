@@ -32,7 +32,7 @@ URL = "http://127.0.0.1:%d/hook" % srv.server_port
 
 CFG = dict(km.DEFAULTS, serial=None, chat_name_id="id/name", unread_badge_id="id/unread",
            discord_webhook_url=URL, launch_wait_sec=0, settle_sec=0, dwell_sec=0, late_wait_sec=0,
-           failure_dump=str(Path(__file__).resolve().parent / "_failure_dump_test.xml"))
+           failure_dump_dir=str(Path(__file__).resolve().parent / "_failure_dumps_test"))
 
 
 def xml(rows, tab=True, bottom=False):
@@ -189,20 +189,29 @@ r = km.run_cycle(CFG, None, "walk", n)
 check("다른 하단 탭에 있으면 채팅 탭을 눌러 이동한 뒤 진행", r == 0 and FakeUi.taps == 2 and FakeUi.dumps == 4)
 
 import os
-_dump_path = CFG["failure_dump"]
-if os.path.exists(_dump_path):
-    os.remove(_dump_path)
+import shutil
+
+
+def dumps():
+    d = Path(CFG["failure_dump_dir"])
+    return sorted(d.glob("*.xml")) if d.exists() else []
+
+
+def clear_dumps():
+    shutil.rmtree(CFG["failure_dump_dir"], ignore_errors=True)
+
+
+clear_dumps()
 FakeUi.script, FakeUi.taps, FakeUi.dumps = [([("FRIEND", "5")], False, True)], 0, 0
 try:
     km.run_cycle(CFG, None, "walk", n)
     check("끝내 못 찾으면 실패", False)
 except km.CycleError as e:
-    check("끝내 못 찾으면 CycleError, 메시지에 덤프 경로 포함", "못 찾음" in str(e) and "_failure_dump_test.xml" in str(e))
+    check("끝내 못 찾으면 CycleError, 메시지에 덤프 경로 포함", "못 찾음" in str(e) and "_no_tab.xml" in str(e))
 check("실패 경로의 덤프 수는 상한(1 + tab_attempts)", FakeUi.dumps == 1 + CFG["tab_attempts"])
 check("실패 경로: 채팅 탭 이동 시도는 tab_attempts 번, 친구 목록은 열지 않음", FakeUi.taps == CFG["tab_attempts"])
-check("실패 시 마지막 UI 덤프를 파일로 저장", os.path.exists(_dump_path) and "FRIEND" in open(_dump_path, encoding="utf-8").read())
-if os.path.exists(_dump_path):
-    os.remove(_dump_path)
+check("실패 시 마지막 UI 덤프를 파일로 저장", len(dumps()) == 1 and "FRIEND" in dumps()[0].read_text(encoding="utf-8"))
+clear_dumps()
 
 # 3-4) 물리 화면의 다른 앱이 덤프로 돌아오는 경우 (사용자가 배터리/Tailscale 앱을 보는 중): 실패가 아닌 건너뜀
 def _tree(packages):
@@ -272,13 +281,45 @@ except km.CycleError:
 check("예외에도 헬퍼 정리", FakeHelper.stopped == before + 1)
 
 # 4-2) 탭을 눌렀지만 선택되지 않음 -> 다른 탭 목록(친구 채팅 포함)을 처리하면 안 됨
+clear_dumps()  # 앞선 4-1 이 남긴 덤프와 섞이지 않게
 FakeUi.script, FakeUi.taps = [([("FRIEND", "5")], "off")], 0
 try:
     km.run_cycle(CFG, None, "walk", n)
     check("탭 선택 실패 -> 예외", False)
 except km.CycleError as e:
     check("탭 선택 실패 -> CycleError", "선택되지 않음" in str(e))
+    check("탭 선택 실패: 메시지에 덤프 경로 포함", "_not_selected.xml" in str(e))
 check("탭 선택 실패: 탭만 2번 누르고 채널은 열지 않음", FakeUi.taps == 2)
+check("탭 선택 실패: 덤프 파일이 실제로 저장됨", len(dumps()) == 1 and dumps()[0].name.endswith("_not_selected.xml"))
+clear_dumps()
+
+# 4-3) 탭을 누른 뒤 탭이 화면에서 사라짐 -> 사라진 뒤의 화면을 덤프로 남겨야 원인을 볼 수 있다
+FakeUi.script, FakeUi.taps = [([("FRIEND", "5")], "off"), ([("POPUP", "")], False)], 0
+try:
+    km.run_cycle(CFG, None, "walk", n)
+    check("탭 사라짐 -> 예외", False)
+except km.CycleError as e:
+    check("탭 사라짐 -> CycleError, 덤프 경로 포함", "사라짐" in str(e) and "_tab_vanished.xml" in str(e))
+check("탭 사라짐: 사라진 뒤의 화면이 저장됨", len(dumps()) == 1 and "POPUP" in dumps()[0].read_text(encoding="utf-8"))
+clear_dumps()
+
+# 4-4) 연속 실패에서 처음 실패한 화면이 덮어써지지 않고, 최근 failure_dump_keep 개만 남는다
+import time as _time
+_keep_cfg = dict(CFG, failure_dump_keep=3)
+_root = xml([("A", None)])
+_paths = []
+for _i, _kind in enumerate(["no_tab", "not_selected", "tab_vanished", "not_selected", "no_tab"]):
+    _real = km.time.strftime
+    km.time.strftime = lambda fmt, _i=_i: "20260101_00000%d" % _i
+    try:
+        _paths.append(km.save_failure_dump(_root, _keep_cfg, _kind))
+    finally:
+        km.time.strftime = _real
+check("덤프 보관: 상한(3)을 넘으면 오래된 것부터 지움", [Path(p).name for p in map(Path, _paths[2:])] == [d.name for d in dumps()])
+check("덤프 보관: 파일명에 시각과 종류", dumps()[0].name == "20260101_000002_tab_vanished.xml")
+check("덤프 보관: 저장 실패(디렉터리 불가)는 None 이고 예외를 내지 않음",
+      km.save_failure_dump(_root, dict(_keep_cfg, failure_dump_dir=str(Path(__file__).resolve())), "no_tab") is None)
+clear_dumps()
 
 # 5) 알림 미설정이면 조용히 로그만
 os_env = km.os.environ.pop("KMUTE_DISCORD_WEBHOOK", None)
@@ -303,7 +344,6 @@ check("잠금 판별: 키가드만 잠김", km.device_locked(FakeAdb(TRUST_UNLOC
 check("잠금 판별: 값을 못 읽으면 None", km.device_locked(FakeAdb("", "")) is None)
 check("잠금 판별: 한쪽만 읽혀도 판단", km.device_locked(FakeAdb("", "    isKeyguardShowing=false")) is False)
 
-if os.path.exists(CFG["failure_dump"]):
-    os.remove(CFG["failure_dump"])
+clear_dumps()
 print("ALL PASS" if ok else "SOME FAILED")
 sys.exit(0 if ok else 1)
