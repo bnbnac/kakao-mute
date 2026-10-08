@@ -21,6 +21,7 @@ import kmute_store as ks
 
 logging.disable(logging.CRITICAL)
 HOST = "it-%d" % int(time.time())
+HOST3 = HOST + "-dump"
 ok = True
 
 
@@ -101,8 +102,24 @@ try:
     check("재시작 직후에도 30분 규칙 유지: 사이클 안 돌림", len(cycle_calls) == 1)
     check("Poller 하트비트가 DB 에 기록됨", query("SELECT locked FROM heartbeat WHERE host=%s", (HOST2,))[0][0] is False)
     check("Poller 사이클 로그가 DB 에 기록됨", query("SELECT count(*) FROM cycle_log WHERE host=%s", (HOST2,))[0][0] == 1)
+
+    # 실패 덤프: 호스트당 최근 N개만 남고, 같은 사이클의 cycle_log 와 started_at 으로 짝지어진다
+    sd = ks.Store(DSN, host=HOST3, dump_keep=3)
+    for i, kind in enumerate(["no_tab", "not_selected", "tab_vanished", "not_selected", "no_tab"]):
+        sd.record_cycle(1000.0 + i, 1.0, "error", error="e%d" % i)
+        sd.record_dump(1000.0 + i, kind, "<hierarchy n='%d' 한글='채팅'/>" % i)
+    rows = query("SELECT kind, body FROM failure_dump WHERE host=%s ORDER BY id", (HOST3,))
+    check("덤프 보관: 최근 3개만 남음", [r[0] for r in rows] == ["tab_vanished", "not_selected", "no_tab"])
+    check("덤프 본문(한글 포함)이 그대로 저장됨", rows[0][1] == "<hierarchy n='2' 한글='채팅'/>")
+    other = ks.Store(DSN, host=HOST3 + "-b", dump_keep=3)
+    other.record_dump(2000.0, "no_tab", "<x/>")
+    check("덤프 보관은 호스트별로 독립", query("SELECT count(*) FROM failure_dump WHERE host=%s", (HOST3,))[0][0] == 3)
+    joined = query("SELECT c.error, d.kind FROM failure_dump d JOIN cycle_log c ON c.host = d.host AND c.started_at = d.started_at "
+                   "WHERE d.host=%s ORDER BY d.id", (HOST3,))
+    check("덤프와 cycle_log 가 started_at 으로 짝지어짐", joined == [("e2", "tab_vanished"), ("e3", "not_selected"), ("e4", "no_tab")])
 finally:
-    for h in (HOST, HOST + "-poller"):
+    for h in (HOST, HOST + "-poller", HOST3, HOST3 + "-b"):
+        query("DELETE FROM failure_dump WHERE host=%s", (h,))
         query("DELETE FROM cycle_log WHERE host=%s", (h,))
         query("DELETE FROM heartbeat WHERE host=%s", (h,))
 

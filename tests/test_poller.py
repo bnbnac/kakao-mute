@@ -34,7 +34,7 @@ class FakeStore:
 
     def __init__(self, last_ok=None):
         self.last_ok = last_ok
-        self.heartbeats, self.cycles, self.errors = [], [], []
+        self.heartbeats, self.cycles, self.errors, self.dumps = [], [], [], []
 
     def heartbeat(self, locked):
         self.heartbeats.append(locked)
@@ -42,6 +42,10 @@ class FakeStore:
 
     def record_cycle(self, started, duration, result, opened=None, error=None):
         self.cycles.append((result, opened, error))
+        return True
+
+    def record_dump(self, started, kind, body):
+        self.dumps.append((kind, body))
         return True
 
     def note_error(self, error):
@@ -237,8 +241,17 @@ advance(p, TICK)
 check("기준 시간 경과: 실패 알림 1회", len(notif.sent) == 1 and "boom" in notif.sent[0])
 check("실패는 DB 에 error 로 기록", store.cycles[0][0] == "error" and "boom" in (store.cycles[0][2] or ""))
 check("실패는 last_error 로 남김", store.errors and "boom" in store.errors[0])
+check("덤프가 없는 실패는 DB 덤프를 남기지 않음", store.dumps == [])
 advance(p, RETRY * 2)
 check("복구 알림 (사이클이 실제로 성공했을 때)", any("복구" in s for s in notif.sent) and p.last_ok is not None)
+
+# 7-1) 덤프를 실은 실패는 DB 에 덤프를 남긴다
+Clock.t = 100000.0
+fail_d = km.with_dump(km.CycleError("탭 문제"), _ET.fromstring("<hierarchy><node text='X'/></hierarchy>"), "not_selected")
+p, calls, sleeps, notif, store = make([False], cycle_results=(fail_d,))
+p.step()
+check("덤프를 실은 실패: 종류와 본문을 DB 에 기록", len(store.dumps) == 1 and store.dumps[0][0] == "not_selected"
+      and "text=\"X\"" in store.dumps[0][1].replace("'", '"'))
 
 # 7-2) 사이클이 안 도는 확인 단계는 복구로 치지 않는다
 Clock.t = 100000.0
@@ -344,10 +357,10 @@ check("DSN 없으면 비활성: 기록 안 하고 예외도 없음", s.enabled i
 s, log, connects = store_with()
 check("하트비트 기록 성공", s.heartbeat(False) is True)
 sqls = [q for q, _ in log]
-check("첫 기록 전에 스키마 생성(테이블 2개)", sum("CREATE TABLE IF NOT EXISTS" in q for q in sqls) == 2)
+check("첫 기록 전에 스키마 생성(테이블 3개)", sum("CREATE TABLE IF NOT EXISTS" in q for q in sqls) == 3)
 check("하트비트 upsert 파라미터 (host, 시각, 잠금)", log[-1][1] == ("h1", Clock.t, False) and "heartbeat" in log[-1][0])
 s.heartbeat(True)
-check("스키마는 한 번만 생성, 연결도 재사용", sum("CREATE TABLE" in q for q, _ in log) == 2 and len(connects) == 1)
+check("스키마는 한 번만 생성, 연결도 재사용", sum("CREATE TABLE" in q for q, _ in log) == 3 and len(connects) == 1)
 
 s, log, _ = store_with()
 s.record_cycle(100.0, 12.345, "ok", opened=2)
@@ -362,6 +375,15 @@ s, log, _ = store_with()
 s.record_cycle(100.0, 1.0, "error", error="boom")
 kinds = [q for q, _ in log if "INSERT" in q]
 check("error 사이클: cycles + last_error 기록", len(kinds) == 2 and "last_error" in kinds[1])
+
+s, log, _ = store_with()
+s.dump_keep = 3
+check("덤프 기록 성공", s.record_dump(100.0, "not_selected", "<x/>") is True)
+check("덤프 INSERT 파라미터 (호스트, 사이클 시작 시각, 종류, 본문)",
+      [p for q, p in log if "INSERT INTO failure_dump" in q] == [("h1", 100.0, "not_selected", "<x/>")])
+check("덤프 기록 뒤 호스트당 최근 N개만 남기는 DELETE",
+      [p for q, p in log if "DELETE FROM failure_dump" in q] == [("h1", "h1", 3)])
+check("NullStore: 덤프 기록도 무해", ks.NullStore().record_dump(1, "k", "b") is False)
 
 s, log, connects = store_with(connect_error=1)
 check("연결 실패는 삼키고 False", s.heartbeat(True) is False)

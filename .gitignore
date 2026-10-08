@@ -1,8 +1,6 @@
 helper/build/
 daemon/config.json
 daemon/*.log*
-daemon/failure_dumps/
 daemon/last_failure_dump.xml
-tests/_failure_dumps_test/
 __pycache__/
 tools/results/

@@ -53,7 +53,6 @@ DEFAULTS = {
     "unlock_settle_sec": 5,
     "late_wait_sec": 8,
     "tab_attempts": 2,
-    "failure_dump_dir": "failure_dumps",
     "failure_dump_keep": 5,
     "db_dsn": "",
     "launch_wait_sec": 4,
@@ -364,26 +363,13 @@ def find_chat_tab(root):
     return next((n for n in root.iter("node") if n.attrib.get("content-desc", "").startswith("채팅 탭")), None)
 
 
-def save_failure_dump(root, cfg, kind):
-    """원인을 볼 수 있게 실패 시점의 UI 덤프를 남긴다. 채팅 이름이 들어 있어 gitignore 대상이다.
+def with_dump(error, root, kind):
+    """실패 시점의 UI 덤프를 예외에 실어 올린다. 저장은 DB 를 가진 호출자(Poller)가 한다.
 
-    시각과 실패 종류가 들어간 파일로 저장하고 최근 failure_dump_keep 개만 둔다. 한 파일에 덮어쓰면
-    연속 실패에서 처음 실패한 화면이 사라지기 때문이다. 쓰기 횟수를 아끼려고 실패할 때만 저장한다.
+    채팅 이름이 들어 있다. 연속 실패에서 처음 실패한 화면이 남도록 DB 에는 최근 failure_dump_keep 개를 둔다.
     """
-    directory = (HERE / cfg["failure_dump_dir"]).resolve()
-    path = directory / ("%s_%s.xml" % (time.strftime("%Y%m%d_%H%M%S"), kind))
-    try:
-        directory.mkdir(parents=True, exist_ok=True)
-        path.write_text(ET.tostring(root, encoding="unicode"), encoding="utf-8")
-    except OSError as e:
-        log.warning("실패 덤프 저장 실패: %s", e)
-        return None
-    for old in sorted(directory.glob("*.xml"))[:-max(1, cfg["failure_dump_keep"])]:
-        try:
-            old.unlink()
-        except OSError:
-            pass
-    return str(path)
+    error.dump = (kind, ET.tostring(root, encoding="unicode"))
+    return error
 
 
 def reach_folder_tab(ui, cfg):
@@ -411,9 +397,8 @@ def reach_folder_tab(ui, cfg):
             log.info("폴더 탭도 하단 탭도 안 보임 -> 로딩 중으로 보고 %d초 대기", cfg["late_wait_sec"])
             time.sleep(cfg["late_wait_sec"])
         root = ui.dump()
-    saved = save_failure_dump(root, cfg, "no_tab")
-    raise CycleError("폴더 탭 '%s' 을 못 찾음 (채팅 화면이 아니거나 로딩/로그인/업데이트 화면). 마지막 UI 덤프: %s"
-                     % (cfg["folder_tab"], saved or "저장 실패"))
+    raise with_dump(CycleError("폴더 탭 '%s' 을 못 찾음 (채팅 화면이 아니거나 로딩/로그인/업데이트 화면)" % cfg["folder_tab"]),
+                    root, "no_tab")
 
 
 def run_cycle(cfg, adb, mode="walk", notifier=None):
@@ -440,11 +425,10 @@ def run_cycle(cfg, adb, mode="walk", notifier=None):
                 break
             tab = next((n for n in root.iter("node") if label(n) == cfg["folder_tab"]), None)
             if tab is None:
-                raise CycleError("폴더 탭 '%s' 이 사라짐. 마지막 UI 덤프: %s"
-                                 % (cfg["folder_tab"], save_failure_dump(root, cfg, "tab_vanished") or "저장 실패"))
+                raise with_dump(CycleError("폴더 탭 '%s' 이 사라짐" % cfg["folder_tab"]), root, "tab_vanished")
         else:
-            raise CycleError("폴더 탭 '%s' 을 눌렀지만 선택되지 않음. 다른 탭 목록을 처리하지 않도록 중단. 마지막 UI 덤프: %s"
-                             % (cfg["folder_tab"], save_failure_dump(root, cfg, "not_selected") or "저장 실패"))
+            raise with_dump(CycleError("폴더 탭 '%s' 을 눌렀지만 선택되지 않음. 다른 탭 목록을 처리하지 않도록 중단"
+                                       % cfg["folder_tab"]), root, "not_selected")
 
         if mode == "discover":
             print_nodes(root)
@@ -576,6 +560,9 @@ class Poller:
             raise
         except Exception as e:
             self.store.record_cycle(started, self.clock() - started, "error", error=first_line(e))
+            dump = getattr(e, "dump", None)
+            if dump:
+                self.store.record_dump(started, *dump)
             self._fail(e)
             return
         duration = self.clock() - started
@@ -637,7 +624,7 @@ def main():
     adb = Adb(cfg["serial"])
     notifier = Notifier(cfg)
     dsn = os.environ.get("KMUTE_DB_DSN") or cfg.get("db_dsn") or ""
-    store = kmute_store.Store(dsn) if dsn else kmute_store.NullStore()
+    store = kmute_store.Store(dsn, dump_keep=cfg["failure_dump_keep"]) if dsn else kmute_store.NullStore()
 
     if args.cmd == "check-db":
         if not dsn:
@@ -660,7 +647,12 @@ def main():
     prepare(cfg, adb)
     try:
         if args.cmd in ("once", "discover"):
-            r = run_cycle(cfg, adb, "discover" if args.cmd == "discover" else "walk", notifier)
+            try:
+                r = run_cycle(cfg, adb, "discover" if args.cmd == "discover" else "walk", notifier)
+            except CycleError as e:
+                if getattr(e, "dump", None):
+                    store.record_dump(time.time(), *e.dump)
+                raise
             log.info("결과: %s", "건너뜀" if r is None else "%d개 열음" % r)
             return
         notifier.send("데몬 시작 (잠금 확인 %d초, 직전 확인이 %d분 이상 전일 때만 확인, DB %s)"

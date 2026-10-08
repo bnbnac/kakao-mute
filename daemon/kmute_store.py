@@ -11,6 +11,8 @@
 - 이 기능은 부가 기능이다. DSN 이 없거나, 드라이버가 없거나, DB 가 죽어도 데몬은 계속 동작해야 한다.
   모든 DB 오류는 삼키고 경고만 남기며, 실패하면 retry_sec 동안 재시도하지 않는다.
 - 드라이버(psycopg 또는 psycopg2)는 DSN 이 설정됐을 때만 불러온다.
+- `failure_dump` 에는 사이클이 폴더 탭 단계에서 실패했을 때의 UI 덤프(XML)를 호스트당 최근 N개 둔다.
+  `started_at` 이 `cycle_log.started_at` 과 같아 시각으로 짝지을 수 있다. 채팅 이름이 들어 있다.
 """
 import logging
 import socket
@@ -36,7 +38,20 @@ SCHEMA = [
         opened integer,
         error text
     )""",
+    """CREATE TABLE IF NOT EXISTS failure_dump (
+        id bigserial PRIMARY KEY,
+        host text NOT NULL,
+        started_at timestamptz NOT NULL,
+        kind text NOT NULL,
+        body text NOT NULL
+    )""",
 ]
+
+SQL_DUMP = """INSERT INTO failure_dump (host, started_at, kind, body)
+VALUES (%s, to_timestamp(%s), %s, %s)"""
+
+SQL_DUMP_PRUNE = """DELETE FROM failure_dump WHERE host = %s AND id NOT IN
+(SELECT id FROM failure_dump WHERE host = %s ORDER BY id DESC LIMIT %s)"""
 
 SQL_HEARTBEAT = """INSERT INTO heartbeat (host, last_check_ok, locked, updated_at)
 VALUES (%s, to_timestamp(%s), %s, now())
@@ -77,12 +92,13 @@ def default_connect(dsn):
 
 
 class Store:
-    def __init__(self, dsn, host=None, connect=None, clock=time.time, retry_sec=60):
+    def __init__(self, dsn, host=None, connect=None, clock=time.time, retry_sec=60, dump_keep=5):
         self.dsn = dsn or ""
         self.host = host or socket.gethostname()
         self._connect = connect or default_connect
         self.clock = clock
         self.retry_sec = retry_sec
+        self.dump_keep = max(1, dump_keep)
         self.conn = None
         self.schema_ok = False
         self.down_until = 0.0
@@ -157,6 +173,11 @@ class Store:
             stmts.append((SQL_ERROR, (self.host, (error or "")[:500])))
         return self._run(*stmts)
 
+    def record_dump(self, started_at, kind, body):
+        """실패한 사이클의 UI 덤프를 남기고 호스트당 최근 dump_keep 개만 둔다."""
+        return self._run((SQL_DUMP, (self.host, started_at, kind, body)),
+                         (SQL_DUMP_PRUNE, (self.host, self.host, self.dump_keep)))
+
     def note_error(self, error):
         """사이클 밖의 오류(폰 접속 실패 등)를 last_error 에 남긴다."""
         return self._run((SQL_ERROR, (self.host, (error or "")[:500])))
@@ -178,6 +199,9 @@ class NullStore:
         return False
 
     def record_cycle(self, *a, **kw):
+        return False
+
+    def record_dump(self, *a, **kw):
         return False
 
     def note_error(self, error):

@@ -68,7 +68,7 @@ python daemon/kakao_mute.py run           # 폴링 루프 (잠금 해제 중에�
 | `discord_webhook_url` | `""` | 실패 알림 (환경변수 `KMUTE_DISCORD_WEBHOOK`도 가능) |
 | `alert_after_sec` / `alert_repeat_sec` | 1800 / 10800 | 실패가 이 시간 이상 계속되면 알림 / 알림 반복 간격 |
 | `alert_min_interval_sec` | 21600 | 같은 채널의 멈춤 알림 최소 간격 |
-| `failure_dump_dir` / `failure_dump_keep` | `failure_dumps` / 5 | 탭을 못 찾거나 선택·유지에 실패한 시점의 UI 덤프를 저장할 디렉터리(절대 경로 가능, 예: NFS)와 보관 개수. 실패할 때만 쓴다. 채팅 이름이 들어 있다 |
+| `failure_dump_keep` | 5 | 폴더 탭 단계에서 사이클이 실패했을 때의 UI 덤프를 DB(`failure_dump`)에 호스트당 최근 몇 개 둘지. DB 가 없으면 덤프는 남지 않는다 |
 
 resource-id는 카톡을 업데이트하면 바뀔 수 있다. 동작이 깨지면 `discover`로 다시 확인한다.
 
@@ -95,6 +95,7 @@ python daemon/kakao_mute.py check-db            # 연결, 테이블 생성, 하�
 |---|---|
 | `heartbeat` (호스트당 1행) | `last_check_ok` 마지막 확인 성공(데몬 생존 + 폰 접속), `last_cycle_ok` 마지막 사이클 성공, `locked`, `last_error` |
 | `cycle_log` | 사이클마다 한 행: 시작 시각, 소요 시간, `result`(ok/skipped/error), 연 채널 수, 오류 |
+| `failure_dump` | 폴더 탭 단계에서 실패한 사이클의 UI 덤프(XML) 최근 N개. `started_at`이 `cycle_log.started_at`과 같아 시각으로 짝지을 수 있다. 채팅 이름이 들어 있다 |
 
 **외부 감시는 `last_check_ok` 기준으로 건다.** 폰이 잠겨 있는 동안은 사이클이 안 도는 것이 정상이라 `last_cycle_ok`가 오래됐다고 이상으로 보면 오탐이다. 예를 들어 이런 조회가 N분 이상이면 알린다 (잠금 확인 간격의 몇 배로).
 
